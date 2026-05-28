@@ -1007,8 +1007,7 @@ def _openai_to_anthropic_body(request_body: ChatCompletionRequest) -> Dict[str, 
         body["system"] = system
     if request_body.temperature is not None:
         body["temperature"] = min(request_body.temperature, 1.0)
-    if request_body.top_p is not None:
-        body["top_p"] = request_body.top_p
+    body["top_p"] = request_body.top_p if (request_body.top_p is not None and request_body.top_p != 1.0) else None
     if request_body.stop:
         body["stop_sequences"] = [request_body.stop] if isinstance(request_body.stop, str) else request_body.stop
     return body
