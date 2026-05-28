@@ -325,41 +325,45 @@ claude_cli = ClaudeCodeCLI(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Verify Claude Code authentication and CLI on startup."""
-    logger.info("Verifying Claude Code authentication and CLI...")
-
-    # Validate authentication first
-    auth_valid, auth_info = validate_claude_code_auth()
-
-    if not auth_valid:
-        logger.error("❌ Claude Code authentication failed!")
-        for error in auth_info.get("errors", []):
-            logger.error(f"  - {error}")
-        logger.warning("Authentication setup guide:")
-        logger.warning("  1. For Anthropic API: Set ANTHROPIC_API_KEY")
-        logger.warning("  2. For Bedrock: Set CLAUDE_CODE_USE_BEDROCK=1 + AWS credentials")
-        logger.warning("  3. For Vertex AI: Set CLAUDE_CODE_USE_VERTEX=1 + GCP credentials")
+    if ANTHROPIC_BASE_URL:
+        logger.info(f"✅ Proxy mode: all requests will be forwarded to {ANTHROPIC_BASE_URL}")
+        logger.info("Claude Agent SDK initialization skipped (not needed in proxy mode)")
     else:
-        logger.info(f"✅ Claude Code authentication validated: {auth_info['method']}")
+        logger.info("Verifying Claude Code authentication and CLI...")
 
-    # Verify Claude Agent SDK with timeout for graceful degradation
-    try:
-        logger.info("Testing Claude Agent SDK connection...")
-        # Use asyncio.wait_for to enforce timeout (30 seconds)
-        cli_verified = await asyncio.wait_for(claude_cli.verify_cli(), timeout=30.0)
+        # Validate authentication first
+        auth_valid, auth_info = validate_claude_code_auth()
 
-        if cli_verified:
-            logger.info("✅ Claude Agent SDK verified successfully")
+        if not auth_valid:
+            logger.error("❌ Claude Code authentication failed!")
+            for error in auth_info.get("errors", []):
+                logger.error(f"  - {error}")
+            logger.warning("Authentication setup guide:")
+            logger.warning("  1. For Anthropic API: Set ANTHROPIC_API_KEY")
+            logger.warning("  2. For Bedrock: Set CLAUDE_CODE_USE_BEDROCK=1 + AWS credentials")
+            logger.warning("  3. For Vertex AI: Set CLAUDE_CODE_USE_VERTEX=1 + GCP credentials")
         else:
-            logger.warning("⚠️  Claude Agent SDK verification returned False")
+            logger.info(f"✅ Claude Code authentication validated: {auth_info['method']}")
+
+        # Verify Claude Agent SDK with timeout for graceful degradation
+        try:
+            logger.info("Testing Claude Agent SDK connection...")
+            # Use asyncio.wait_for to enforce timeout (30 seconds)
+            cli_verified = await asyncio.wait_for(claude_cli.verify_cli(), timeout=30.0)
+
+            if cli_verified:
+                logger.info("✅ Claude Agent SDK verified successfully")
+            else:
+                logger.warning("⚠️  Claude Agent SDK verification returned False")
+                logger.warning("The server will start, but requests may fail.")
+        except asyncio.TimeoutError:
+            logger.warning("⚠️  Claude Agent SDK verification timed out (30s)")
+            logger.warning("This may indicate network issues or SDK configuration problems.")
+            logger.warning("The server will start, but first request may be slow.")
+        except Exception as e:
+            logger.error(f"⚠️  Claude Agent SDK verification failed: {e}")
             logger.warning("The server will start, but requests may fail.")
-    except asyncio.TimeoutError:
-        logger.warning("⚠️  Claude Agent SDK verification timed out (30s)")
-        logger.warning("This may indicate network issues or SDK configuration problems.")
-        logger.warning("The server will start, but first request may be slow.")
-    except Exception as e:
-        logger.error(f"⚠️  Claude Agent SDK verification failed: {e}")
-        logger.warning("The server will start, but requests may fail.")
-        logger.warning("Check that Claude Code CLI is properly installed and authenticated.")
+            logger.warning("Check that Claude Code CLI is properly installed and authenticated.")
 
     # Log debug information if debug mode is enabled
     if DEBUG_MODE or VERBOSE:
@@ -381,11 +385,6 @@ async def lifespan(app: FastAPI):
         logger.debug(
             f"🔧 API Key protection: {'Enabled' if (os.getenv('API_KEY') or runtime_api_key) else 'Disabled'}"
         )
-
-    if ANTHROPIC_BASE_URL:
-        logger.info(f"✅ /v1/messages proxy mode enabled → {ANTHROPIC_BASE_URL}")
-    else:
-        logger.info("/v1/messages will use Claude Agent SDK (no ANTHROPIC_BASE_URL set)")
 
     # Resolve the default model from the live Anthropic Models API so /v1/chat
     # uses the latest Sonnet without a code change. Best-effort: any failure
@@ -823,20 +822,27 @@ async def chat_completions(
     # Check FastAPI API key if configured
     await verify_api_key(request, credentials)
 
-    # Validate Claude Code authentication
-    auth_valid, auth_info = validate_claude_code_auth()
-
-    if not auth_valid:
-        error_detail = {
-            "message": "Claude Code authentication failed",
-            "errors": auth_info.get("errors", []),
-            "method": auth_info.get("method", "none"),
-            "help": "Check /v1/auth/status for detailed authentication information",
-        }
-        raise HTTPException(status_code=503, detail=error_detail)
-
     try:
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
+
+        # Proxy mode: convert OpenAI → Anthropic, forward to upstream, convert back
+        if ANTHROPIC_BASE_URL:
+            logger.info(
+                f"Proxying /v1/chat/completions to {ANTHROPIC_BASE_URL} (model={request_body.model}, stream={request_body.stream})"
+            )
+            return await _proxy_chat_completions_to_upstream(request_body, request, request_id)
+
+        # Validate Claude Code authentication
+        auth_valid, auth_info = validate_claude_code_auth()
+
+        if not auth_valid:
+            error_detail = {
+                "message": "Claude Code authentication failed",
+                "errors": auth_info.get("errors", []),
+                "method": auth_info.get("method", "none"),
+                "help": "Check /v1/auth/status for detailed authentication information",
+            }
+            raise HTTPException(status_code=503, detail=error_detail)
 
         # Extract Claude-specific parameters from headers
         claude_headers = ParameterValidator.extract_claude_headers(dict(request.headers))
@@ -967,13 +973,8 @@ async def chat_completions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def _proxy_messages_to_upstream(
-    request_body: AnthropicMessagesRequest,
-    request: Request,
-) -> StreamingResponse | JSONResponse:
-    """Proxy a /v1/messages request to the configured ANTHROPIC_BASE_URL."""
-    upstream_url = f"{ANTHROPIC_BASE_URL.rstrip('/')}/v1/messages"
-
+def _build_upstream_headers(request: Request) -> Dict[str, str]:
+    """Build headers for proxying to the upstream Anthropic-compatible endpoint."""
     api_key = request.headers.get("x-api-key") or os.getenv("ANTHROPIC_API_KEY", "")
     headers = {
         "content-type": "application/json",
@@ -983,7 +984,164 @@ async def _proxy_messages_to_upstream(
     for passthrough in ("anthropic-beta",):
         if val := request.headers.get(passthrough):
             headers[passthrough] = val
+    return headers
 
+
+def _openai_to_anthropic_body(request_body: ChatCompletionRequest) -> Dict[str, Any]:
+    """Convert an OpenAI ChatCompletion request to an Anthropic Messages API body."""
+    system = None
+    messages: List[Dict[str, Any]] = []
+    for msg in request_body.messages:
+        if msg.role == "system":
+            system = msg.content if isinstance(msg.content, str) else str(msg.content)
+        else:
+            messages.append({"role": msg.role, "content": msg.content})
+
+    body: Dict[str, Any] = {
+        "model": request_body.model,
+        "messages": messages,
+        "max_tokens": request_body.max_completion_tokens or request_body.max_tokens or 4096,
+        "stream": bool(request_body.stream),
+    }
+    if system:
+        body["system"] = system
+    if request_body.temperature is not None:
+        body["temperature"] = min(request_body.temperature, 1.0)
+    if request_body.top_p is not None:
+        body["top_p"] = request_body.top_p
+    if request_body.stop:
+        body["stop_sequences"] = [request_body.stop] if isinstance(request_body.stop, str) else request_body.stop
+    return body
+
+
+def _anthropic_response_to_openai(anthropic_resp: Dict[str, Any], request_id: str) -> Dict[str, Any]:
+    """Convert an Anthropic Messages API response to OpenAI ChatCompletion format."""
+    content_parts = []
+    for block in anthropic_resp.get("content", []):
+        if isinstance(block, dict) and block.get("type") == "text":
+            content_parts.append(block["text"])
+    content = "\n".join(content_parts)
+
+    stop_reason = anthropic_resp.get("stop_reason", "end_turn")
+    finish_map = {"end_turn": "stop", "max_tokens": "length", "stop_sequence": "stop"}
+
+    usage = anthropic_resp.get("usage", {})
+    prompt_tokens = usage.get("input_tokens", 0)
+    completion_tokens = usage.get("output_tokens", 0)
+
+    return {
+        "id": request_id,
+        "object": "chat.completion",
+        "created": int(datetime.now(timezone.utc).timestamp()),
+        "model": anthropic_resp.get("model", ""),
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content, "name": None},
+            "finish_reason": finish_map.get(stop_reason, "stop"),
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        "system_fingerprint": None,
+    }
+
+
+async def _proxy_chat_completions_to_upstream(
+    request_body: ChatCompletionRequest,
+    request: Request,
+    request_id: str,
+):
+    """Proxy /v1/chat/completions by converting OpenAI→Anthropic, calling upstream, converting back."""
+    upstream_url = f"{ANTHROPIC_BASE_URL.rstrip('/')}/v1/messages"
+    headers = _build_upstream_headers(request)
+    body = _openai_to_anthropic_body(request_body)
+
+    if request_body.stream:
+        async def _stream_openai():
+            # Send initial role chunk
+            initial = ChatCompletionStreamResponse(
+                id=request_id,
+                model=request_body.model,
+                choices=[StreamChoice(index=0, delta={"role": "assistant", "content": ""}, finish_reason=None)],
+            )
+            yield f"data: {initial.model_dump_json()}\n\n"
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
+                async with client.stream("POST", upstream_url, json=body, headers=headers) as resp:
+                    if resp.status_code != 200:
+                        error_body = await resp.aread()
+                        error_chunk = {"error": {"message": error_body.decode(), "type": "upstream_error"}}
+                        yield f"data: {json.dumps(error_chunk)}\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data = line[6:]
+                        if data.strip() == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+
+                        event_type = event.get("type", "")
+
+                        if event_type == "content_block_delta":
+                            delta = event.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                chunk = ChatCompletionStreamResponse(
+                                    id=request_id,
+                                    model=request_body.model,
+                                    choices=[StreamChoice(index=0, delta={"content": delta["text"]}, finish_reason=None)],
+                                )
+                                yield f"data: {chunk.model_dump_json()}\n\n"
+
+                        elif event_type == "message_delta":
+                            stop_reason = event.get("delta", {}).get("stop_reason", "end_turn")
+                            finish_map = {"end_turn": "stop", "max_tokens": "length", "stop_sequence": "stop"}
+                            usage_data = None
+                            if request_body.stream_options and request_body.stream_options.include_usage:
+                                u = event.get("usage", {})
+                                usage_data = Usage(
+                                    prompt_tokens=u.get("input_tokens", 0),
+                                    completion_tokens=u.get("output_tokens", 0),
+                                    total_tokens=u.get("input_tokens", 0) + u.get("output_tokens", 0),
+                                )
+                            final = ChatCompletionStreamResponse(
+                                id=request_id,
+                                model=request_body.model,
+                                choices=[StreamChoice(index=0, delta={}, finish_reason=finish_map.get(stop_reason, "stop"))],
+                                usage=usage_data,
+                            )
+                            yield f"data: {final.model_dump_json()}\n\n"
+
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            _stream_openai(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    # Non-streaming
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+        resp = await client.post(upstream_url, json=body, headers=headers)
+
+    if resp.status_code != 200:
+        return JSONResponse(status_code=resp.status_code, content=resp.json())
+
+    return JSONResponse(content=_anthropic_response_to_openai(resp.json(), request_id))
+
+
+async def _proxy_messages_to_upstream(
+    request_body: AnthropicMessagesRequest,
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """Proxy a /v1/messages request directly to the configured ANTHROPIC_BASE_URL."""
+    upstream_url = f"{ANTHROPIC_BASE_URL.rstrip('/')}/v1/messages"
+    headers = _build_upstream_headers(request)
     body = request_body.model_dump(exclude_none=True)
 
     if request_body.stream:
