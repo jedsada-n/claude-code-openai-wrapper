@@ -115,6 +115,11 @@ RESOLVED_DEFAULT_MODEL: Optional[str] = None
 # Can be overridden via FAST_MODEL environment variable
 FAST_MODEL = os.getenv("FAST_MODEL", "claude-haiku-4-5-20251001")
 
+# Custom base URL for proxying /v1/messages to an upstream endpoint.
+# When set, /v1/messages forwards requests via HTTP instead of the Claude Agent SDK.
+# Example: ANTHROPIC_BASE_URL=https://api.anthropic.com
+ANTHROPIC_BASE_URL: Optional[str] = os.getenv("ANTHROPIC_BASE_URL")
+
 # Anthropic Models API configuration for dynamically refreshing /v1/models
 ANTHROPIC_MODELS_URL = os.getenv("ANTHROPIC_MODELS_URL", "https://api.anthropic.com/v1/models")
 ANTHROPIC_VERSION = os.getenv("ANTHROPIC_VERSION", "2023-06-01")

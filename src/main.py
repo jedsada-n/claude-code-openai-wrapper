@@ -57,6 +57,7 @@ from datetime import datetime, timezone
 
 from src import constants
 from src.constants import (
+    ANTHROPIC_BASE_URL,
     ANTHROPIC_MODELS_URL,
     ANTHROPIC_VERSION,
     CLAUDE_MODELS,
@@ -380,6 +381,11 @@ async def lifespan(app: FastAPI):
         logger.debug(
             f"🔧 API Key protection: {'Enabled' if (os.getenv('API_KEY') or runtime_api_key) else 'Disabled'}"
         )
+
+    if ANTHROPIC_BASE_URL:
+        logger.info(f"✅ /v1/messages proxy mode enabled → {ANTHROPIC_BASE_URL}")
+    else:
+        logger.info("/v1/messages will use Claude Agent SDK (no ANTHROPIC_BASE_URL set)")
 
     # Resolve the default model from the live Anthropic Models API so /v1/chat
     # uses the latest Sonnet without a code change. Best-effort: any failure
@@ -961,6 +967,50 @@ async def chat_completions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def _proxy_messages_to_upstream(
+    request_body: AnthropicMessagesRequest,
+    request: Request,
+) -> StreamingResponse | JSONResponse:
+    """Proxy a /v1/messages request to the configured ANTHROPIC_BASE_URL."""
+    upstream_url = f"{ANTHROPIC_BASE_URL.rstrip('/')}/v1/messages"
+
+    api_key = request.headers.get("x-api-key") or os.getenv("ANTHROPIC_API_KEY", "")
+    headers = {
+        "content-type": "application/json",
+        "anthropic-version": request.headers.get("anthropic-version", ANTHROPIC_VERSION),
+        "x-api-key": api_key,
+    }
+    for passthrough in ("anthropic-beta",):
+        if val := request.headers.get(passthrough):
+            headers[passthrough] = val
+
+    body = request_body.model_dump(exclude_none=True)
+
+    if request_body.stream:
+        async def _stream_proxy():
+            async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
+                async with client.stream("POST", upstream_url, json=body, headers=headers) as resp:
+                    if resp.status_code != 200:
+                        error_body = await resp.aread()
+                        yield error_body.decode()
+                        return
+                    async for line in resp.aiter_lines():
+                        yield f"{line}\n"
+
+        return StreamingResponse(
+            _stream_proxy(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+        resp = await client.post(upstream_url, json=body, headers=headers)
+
+    if resp.status_code != 200:
+        return JSONResponse(status_code=resp.status_code, content=resp.json())
+    return JSONResponse(content=resp.json())
+
+
 @app.post("/v1/messages")
 @rate_limit_endpoint("chat")
 async def anthropic_messages(
@@ -972,9 +1022,18 @@ async def anthropic_messages(
 
     This endpoint provides compatibility with the native Anthropic SDK,
     allowing tools like VC to use this wrapper via the VC_API_BASE setting.
+
+    When ANTHROPIC_BASE_URL is set, requests are proxied directly to the
+    upstream endpoint instead of being routed through the Claude Agent SDK.
     """
     # Check FastAPI API key if configured
     await verify_api_key(request, credentials)
+
+    if ANTHROPIC_BASE_URL:
+        logger.info(
+            f"Proxying /v1/messages to {ANTHROPIC_BASE_URL} (model={request_body.model}, stream={request_body.stream})"
+        )
+        return await _proxy_messages_to_upstream(request_body, request)
 
     # Validate Claude Code authentication
     auth_valid, auth_info = validate_claude_code_auth()
